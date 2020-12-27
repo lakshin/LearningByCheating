@@ -13,6 +13,7 @@ import carla
 
 from carla import ColorConverter
 from carla import WeatherParameters
+from carla import VehicleLightState as vls
 
 from .map_utils import Wrapper as map_utils
 
@@ -221,8 +222,8 @@ class PedestrianTracker(object):
                     loc = _loc
                     break
             
-            ped_controller.teleport_to_location(loc)
-            print ("Teleported walker %d to %s"%(ped_id, loc))
+            #ped_controller.teleport_to_location(loc)
+            #print ("Teleported walker %d to %s"%(ped_id, loc))
         
 
 class TrafficTracker(object):
@@ -351,7 +352,7 @@ class CarlaWrapper(object):
             
         self._client.set_timeout(30.0)
 
-        set_sync_mode(self._client, False)
+        #set_sync_mode(self._client, False)
 
         self._town_name = town
         self._world = self._client.load_world(town)
@@ -392,86 +393,172 @@ class CarlaWrapper(object):
         
 
     def spawn_vehicles(self):
+        car_lights_on = False
+        hybrid = False
+        safe = False
+        batch = []
+        filterv = 'vehicle.*'
+        traffic_manager = self._client.get_trafficmanager(8000)
+        synchronous_master = False
+        sync = True
 
-        blueprints = self._blueprints.filter('vehicle.*')
-        if self.disable_two_wheels:
+        traffic_manager.set_global_distance_to_leading_vehicle(2.0)
+        if hybrid:
+            traffic_manager.set_hybrid_physics_mode(True)
+
+        if sync:
+            settings = self._world.get_settings()
+            traffic_manager.set_synchronous_mode(True)
+            if not settings.synchronous_mode:
+                synchronous_master = True
+                settings.synchronous_mode = True
+                settings.fixed_delta_seconds = 0.05
+                self._world.apply_settings(settings)
+            else:
+                synchronous_master = False
+
+        blueprints = self._world.get_blueprint_library().filter(filterv)
+
+        if safe:
             blueprints = [x for x in blueprints if int(x.get_attribute('number_of_wheels')) == 4]
-        spawn_points = self._map.get_spawn_points()
+            blueprints = [x for x in blueprints if not x.id.endswith('isetta')]
+            blueprints = [x for x in blueprints if not x.id.endswith('carlacola')]
+            blueprints = [x for x in blueprints if not x.id.endswith('cybertruck')]
+            blueprints = [x for x in blueprints if not x.id.endswith('t2')]
 
-        for i in range(self.n_vehicles):
-            blueprint = np.random.choice(blueprints)
-            blueprint.set_attribute('role_name', 'autopilot')
-    
+        spawn_points = self._world.get_map().get_spawn_points()
+        number_of_spawn_points = len(spawn_points)
+
+        if self.n_vehicles < number_of_spawn_points:
+            random.shuffle(spawn_points)
+        elif self.n_vehicles > number_of_spawn_points:
+            msg = 'requested %d vehicles, but could only find %d spawn points'
+            #logging.warning(msg, number_of_vehicles, number_of_spawn_points)
+            self.n_vehicles = number_of_spawn_points
+
+        # @todo cannot import these directly.
+        SpawnActor = carla.command.SpawnActor
+        SetAutopilot = carla.command.SetAutopilot
+        SetVehicleLightState = carla.command.SetVehicleLightState
+        FutureActor = carla.command.FutureActor
+
+        for n, transform in enumerate(spawn_points):
+            if n >= self.n_vehicles:
+                break
+            blueprint = random.choice(blueprints)
             if blueprint.has_attribute('color'):
-                color = np.random.choice(blueprint.get_attribute('color').recommended_values)
+                color = random.choice(blueprint.get_attribute('color').recommended_values)
                 blueprint.set_attribute('color', color)
-
             if blueprint.has_attribute('driver_id'):
-                driver_id = np.random.choice(blueprint.get_attribute('driver_id').recommended_values)
+                driver_id = random.choice(blueprint.get_attribute('driver_id').recommended_values)
                 blueprint.set_attribute('driver_id', driver_id)
-            
-            vehicle = None
-            while vehicle is None:
-                vehicle = self._world.try_spawn_actor(blueprint, np.random.choice(spawn_points))
+            blueprint.set_attribute('role_name', 'autopilot')
 
-            vehicle.set_autopilot(True)
-            #vehicle.start_dtcrowd()
+            # prepare the light state of the cars to spawn
+            light_state = vls.NONE
+            if car_lights_on:
+                light_state = vls.Position | vls.LowBeam | vls.LowBeam
 
-            self._actor_dict['vehicle'].append(vehicle)
+            # spawn the cars and set their autopilot and light state all together
+            batch.append(SpawnActor(blueprint, transform)
+                         .then(SetAutopilot(FutureActor, True, traffic_manager.get_port()))
+                         .then(SetVehicleLightState(FutureActor, light_state)))
 
-        print ("spawned %d vehicles"%len(self._actor_dict['vehicle']))
+        for response in self._client.apply_batch_sync(batch, synchronous_master):
+            if response.error:
+                #logging.error(response.error)
+                print(response.error)
+            else:
+                self._actor_dict['vehicle'].append(response.actor_id)
+
+        print("spawned %d vehicles" % len(self._actor_dict['vehicle']))
 
     def spawn_pedestrians(self, n_pedestrians):
-        SpawnActor = carla.command.SpawnActor
 
-        peds_spawned = 0
-        
         walkers = []
         controllers = []
-        
-        while peds_spawned < n_pedestrians:
-            spawn_points = []
-            _walkers = []
-            _controllers = []
-            
-            for i in range(n_pedestrians - peds_spawned):
-                spawn_point = carla.Transform()
-                loc = self._world.get_random_location_from_navigation()
-    
-                if loc is not None:
-                    spawn_point.location = loc
-                    spawn_points.append(spawn_point)
-    
-            blueprints = self._blueprints.filter('walker.pedestrian.*')
-            batch = []
-            for spawn_point in spawn_points:
-                walker_bp = random.choice(blueprints)
-    
-                if walker_bp.has_attribute('is_invincible'):
-                    walker_bp.set_attribute('is_invincible', 'false')
-    
-                batch.append(SpawnActor(walker_bp, spawn_point))
-    
-            for result in self._client.apply_batch_sync(batch, True):
-                if result.error:
-                    print(result.error)
-                else:
-                    peds_spawned += 1
-                    _walkers.append(result.actor_id)
-    
-            walker_controller_bp = self._blueprints.find('controller.ai.walker')
-            batch = [SpawnActor(walker_controller_bp, carla.Transform(), walker) for walker in _walkers]
-    
-            for result in self._client.apply_batch_sync(batch, True):
-                if result.error:
-                    print(result.error)
-                else:
-                    _controllers.append(result.actor_id)
-                    
-            controllers.extend(_controllers)
-            walkers.extend(_walkers)
 
-        print ("spawned %d pedestrians"%len(controllers))
+        walkers_list = []
+        all_id = []
+
+        filterw = 'walker.pedestrian.*'
+        blueprintsWalkers = self._world.get_blueprint_library().filter(filterw)
+
+        # @todo cannot import these directly.
+        SpawnActor = carla.command.SpawnActor
+
+        percentagePedestriansRunning = 0.0  # how many pedestrians will run
+        percentagePedestriansCrossing = 0.0  # how many pedestrians will walk through the road
+        # 1. take all the random locations to spawn
+        spawn_points = []
+        for i in range(n_pedestrians):
+            spawn_point = carla.Transform()
+            loc = self._world.get_random_location_from_navigation()
+            if (loc != None):
+                spawn_point.location = loc
+                spawn_points.append(spawn_point)
+        # 2. we spawn the walker object
+        batch = []
+        walker_speed = []
+        for spawn_point in spawn_points:
+            walker_bp = random.choice(blueprintsWalkers)
+            # set as not invincible
+            if walker_bp.has_attribute('is_invincible'):
+                walker_bp.set_attribute('is_invincible', 'false')
+            # set the max speed
+            if walker_bp.has_attribute('speed'):
+                if (random.random() > percentagePedestriansRunning):
+                    # walking
+                    walker_speed.append(walker_bp.get_attribute('speed').recommended_values[1])
+                else:
+                    # running
+                    walker_speed.append(walker_bp.get_attribute('speed').recommended_values[2])
+            else:
+                print("Walker has no speed")
+                walker_speed.append(0.0)
+            batch.append(SpawnActor(walker_bp, spawn_point))
+        results = self._client.apply_batch_sync(batch, True)
+        walker_speed2 = []
+        for i in range(len(results)):
+            if results[i].error:
+                #logging.error(results[i].error)
+                print(results[i].error)
+            else:
+                walkers_list.append({"id": results[i].actor_id})
+                walker_speed2.append(walker_speed[i])
+        walker_speed = walker_speed2
+        # 3. we spawn the walker controller
+        batch = []
+        walker_controller_bp = self._world.get_blueprint_library().find('controller.ai.walker')
+        for i in range(len(walkers_list)):
+            batch.append(SpawnActor(walker_controller_bp, carla.Transform(), walkers_list[i]["id"]))
+        results = self._client.apply_batch_sync(batch, True)
+        for i in range(len(results)):
+            if results[i].error:
+                #logging.error(results[i].error)
+                print(results[i].error)
+            else:
+                walkers_list[i]["con"] = results[i].actor_id
+        # 4. we put altogether the walkers and controllers id to get the objects from their id
+        for i in range(len(walkers_list)):
+            all_id.append(walkers_list[i]["con"])
+            all_id.append(walkers_list[i]["id"])
+            controllers.append(walkers_list[i]["con"])
+            walkers.append(walkers_list[i]["id"])
+        all_actors = self._world.get_actors(all_id)
+
+        # 5. initialize each controller and set target to walk to (list is [controler, actor, controller, actor ...])
+        # set how many pedestrians can cross the road
+        self._world.set_pedestrians_cross_factor(percentagePedestriansCrossing)
+        for i in range(0, len(all_id), 2):
+            # start walker
+            all_actors[i].start()
+            # set walk to random point
+            all_actors[i].go_to_location(self._world.get_random_location_from_navigation())
+            # max speed
+            all_actors[i].set_max_speed(float(walker_speed[int(i / 2)]))
+
+        print('spawned %d walkers, press Ctrl+C to exit.' % len(walkers_list))
 
         return self._world.get_actors(walkers), self._world.get_actors(controllers)
         
@@ -488,6 +575,8 @@ class CarlaWrapper(object):
 
     def init(self, start=0, weather='random', n_vehicles=0, n_pedestrians=0):
         while True:
+            print(self.n_vehicles)
+            print(self.n_pedestrians)
             self.n_vehicles = n_vehicles or self.n_vehicles
             self.n_pedestrians = n_pedestrians or self.n_pedestrians
             self._start_pose = self._map.get_spawn_points()[start]
@@ -602,9 +691,11 @@ class CarlaWrapper(object):
                 }
 
     def clean_up(self):
-        for vehicle in self._actor_dict['vehicle']:
-            # continue
-            vehicle.stop_dtcrowd()
+        # for vehicle in self._actor_dict['vehicle']:
+        #     # continue
+        #     vehicle.stop_dtcrowd()
+        print('\ndestroying %d vehicles' % len(self._actor_dict['vehicle']))
+        self._client.apply_batch([carla.command.DestroyActor(x) for x in self._actor_dict['vehicle']])
         
         for controller in self._actor_dict['ped_controller']:
             controller.stop()

@@ -1,5 +1,14 @@
+
+
 import argparse
 import time
+import sys
+
+try:
+    sys.path.append('carla/carla.egg')
+    sys.path.append('PythonAPI')
+except IndexError:
+    pass
 
 from pathlib import Path
 
@@ -7,6 +16,8 @@ from benchmark import make_suite, get_suites, ALL_SUITES
 from benchmark.run_benchmark import run_benchmark
 
 import bird_view.utils.bz_utils as bzu
+
+import carla
 
 
 def _agent_factory_hack(model_path, config, autopilot):
@@ -43,30 +54,37 @@ def _agent_factory_hack(model_path, config, autopilot):
     return lambda: agent_class(**agent_args)
 
 
-def run(model_path, port, suite, big_cam, seed, autopilot, resume, max_run=10, show=False):
-    log_dir = model_path.parent
-    config = bzu.load_json(str(log_dir / 'config.json'))
+class BenchmarkAgent:
 
-    total_time = 0.0
+    def __init__(self):
+        self.client = carla.Client('127.0.0.1', 2000)
+        self.client.set_timeout(10.0)
 
-    for suite_name in get_suites(suite):
-        tick = time.time()
+    def run(self, model_path, port, suite, big_cam, seed, autopilot, resume, max_run=10, show=False):
+        log_dir = model_path.parent
+        config = bzu.load_json(str(log_dir / 'config.json'))
 
-        benchmark_dir = log_dir / 'benchmark' / model_path.stem / ('%s_seed%d' % (suite_name, seed))
-        benchmark_dir.mkdir(parents=True, exist_ok=True)
+        total_time = 0.0
 
-        with make_suite(suite_name, port=port, big_cam=big_cam) as env:
-            agent_maker = _agent_factory_hack(model_path, config, autopilot)
+        for suite_name in get_suites(suite):
+            tick = time.time()
 
-            run_benchmark(agent_maker, env, benchmark_dir, seed, autopilot, resume, max_run=max_run, show=show)
+            benchmark_dir = log_dir / 'benchmark' / model_path.stem / ('%s_seed%d' % (suite_name, seed))
+            benchmark_dir.mkdir(parents=True, exist_ok=True)
 
-        elapsed = time.time() - tick
-        total_time += elapsed
+            with make_suite(suite_name, port=port, big_cam=big_cam, client=self.client) as env:
 
-        print('%s: %.3f hours.' % (suite_name, elapsed / 3600))
+                agent_maker = _agent_factory_hack(model_path, config, autopilot)
 
-    print('Total time: %.3f hours.' % (total_time / 3600))
+                run_benchmark(agent_maker, env, benchmark_dir, seed, autopilot, resume, max_run=max_run, show=show)
+                time.sleep(20)
 
+            elapsed = time.time() - tick
+            total_time += elapsed
+
+            print('%s: %.3f hours.' % (suite_name, elapsed / 3600))
+
+        print('Total time: %.3f hours.' % (total_time / 3600))
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -81,5 +99,5 @@ if __name__ == '__main__':
     parser.add_argument('--max-run', type=int, default=3)
 
     args = parser.parse_args()
+    BenchmarkAgent().run(Path(args.model_path), args.port, args.suite, args.big_cam, args.seed, args.autopilot, args.resume, max_run=args.max_run, show=args.show)
 
-    run(Path(args.model_path), args.port, args.suite, args.big_cam, args.seed, args.autopilot, args.resume, max_run=args.max_run, show=args.show)

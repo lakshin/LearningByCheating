@@ -208,6 +208,8 @@ def make_suite(suite_name, port=2000, big_cam=False, planner='new', client=None)
     kwargs['big_cam'] = big_cam
     kwargs['planner'] = planner
     kwargs['client'] = client
+    kwargs['n_vehicles'] = 20
+    kwargs['n_pedestrians'] = 20
 
     return PointGoalSuite(*args, **kwargs)
 
